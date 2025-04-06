@@ -9,3 +9,5 @@ utils/build/*
 
 # outputs
 outputs/
+*.pth
+*.zip

@@ -20,6 +20,7 @@ from utils.dist import init_distributed, is_distributed, is_primary, get_rank, b
 from utils.misc import my_worker_init_fn
 from utils.io import save_checkpoint, resume_if_possible
 from utils.logger import Logger
+import plotly.graph_objects as go
 
 
 def make_args_parser():
@@ -99,10 +100,11 @@ def make_args_parser():
     parser.add_argument("--loss_angle_reg_weight", default=0.5, type=float)
     parser.add_argument("--loss_center_weight", default=5.0, type=float)
     parser.add_argument("--loss_size_weight", default=1.0, type=float)
-
+    parser.add_argument("--pretrained_model", default=None, type=str,
+        help="Path to pretrained .pth model to load before training.")
     ##### Dataset #####
     parser.add_argument(
-        "--dataset_name", required=True, type=str, choices=["scannet", "sunrgbd"]
+        "--dataset_name", required=True, type=str, choices=["scannet", "sunrgbd","custom"]
     )
     parser.add_argument(
         "--dataset_root_dir",
@@ -118,8 +120,8 @@ def make_args_parser():
         help="Root directory containing the metadata files. \
               If None, default values from scannet.py/sunrgbd.py are used",
     )
-    parser.add_argument("--dataset_num_workers", default=4, type=int)
-    parser.add_argument("--batchsize_per_gpu", default=8, type=int)
+    parser.add_argument("--dataset_num_workers", default=2, type=int)
+    parser.add_argument("--batchsize_per_gpu", default=1, type=int)
 
     ##### Training #####
     parser.add_argument("--start_epoch", default=-1, type=int)
@@ -162,10 +164,42 @@ def do_train(
 
     num_iters_per_epoch = len(dataloaders["train"])
     num_iters_per_eval_epoch = len(dataloaders["test"])
+
+
+
     print(f"Model is {model}")
+
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total:,}")
+    print(f"Trainable parameters: {trainable:,}")
+
     print(f"Training started at epoch {args.start_epoch} until {args.max_epoch}.")
     print(f"One training epoch = {num_iters_per_epoch} iters.")
     print(f"One eval epoch = {num_iters_per_eval_epoch} iters.")
+
+
+    if args.pretrained_model is not None:
+      print(f"Loading pretrained weights from {args.pretrained_model}")
+      ckpt = torch.load(args.pretrained_model, map_location="cpu")
+      state_dict = ckpt["model"] if "model" in ckpt else ckpt
+      model_dict = model_no_ddp.state_dict()
+      compatible = {
+          k: v for k, v in state_dict.items()
+          if k in model_dict and v.shape == model_dict[k].shape
+      }
+      model_dict.update(compatible)
+      model_no_ddp.load_state_dict(model_dict)
+      print(f" Loaded {len(compatible)} pretrained layers.")
+
+
+      print("Freezing pre_encoder and encoder layers...")
+      for name, param in model_no_ddp.named_parameters():
+          if name.startswith("pre_encoder") or name.startswith("encoder"):
+              param.requires_grad = False
+              print(f" - Frozen: {name}")
+      num_frozen = sum(not p.requires_grad for p in model_no_ddp.parameters())
+      num_total = sum(1 for p in model_no_ddp.parameters())
 
     final_eval = os.path.join(args.checkpoint_dir, "final_eval.txt")
     final_eval_pkl = os.path.join(args.checkpoint_dir, "final_eval.pkl")
@@ -306,7 +340,7 @@ def test_model(args, model, model_no_ddp, criterion, dataset_config, dataloaders
         f"Please specify a test checkpoint using --test_ckpt. Found invalid value {args.test_ckpt}"
         sys.exit(1)
 
-    sd = torch.load(args.test_ckpt, map_location=torch.device("cpu"))
+    sd = torch.load(args.test_ckpt, map_location=torch.device("cpu"), weights_only=False)
     model_no_ddp.load_state_dict(sd["model"])
     logger = Logger()
     criterion = None  # do not compute loss for speed-up; Comment out to see test loss
@@ -364,23 +398,34 @@ def main(local_rank, args):
     criterion = build_criterion(args, dataset_config)
     criterion = criterion.cuda(local_rank)
 
+
+
     dataloaders = {}
     if args.test_only:
         dataset_splits = ["test"]
     else:
         dataset_splits = ["train", "test"]
+
+
+    print(f"Looking for files in: {args.dataset_root_dir}")
+    print("Found files:", len(os.listdir(args.dataset_root_dir)))
+    
     for split in dataset_splits:
-        if split == "train":
-            shuffle = True
-        else:
-            shuffle = False
+  
+        # Skip if dataset doesn't exist for this split
+        if split not in datasets or len(datasets[split]) == 0:
+            print(f"Warning: No data available for split {split}")
+            continue
+            
+        shuffle = (split == "train")
+        
         if is_distributed():
             sampler = DistributedSampler(datasets[split], shuffle=shuffle)
         elif shuffle:
             sampler = torch.utils.data.RandomSampler(datasets[split])
         else:
             sampler = torch.utils.data.SequentialSampler(datasets[split])
-
+        
         dataloaders[split] = DataLoader(
             datasets[split],
             sampler=sampler,
@@ -388,7 +433,8 @@ def main(local_rank, args):
             num_workers=args.dataset_num_workers,
             worker_init_fn=my_worker_init_fn,
         )
-        dataloaders[split + "_sampler"] = sampler
+        dataloaders[f"{split}_sampler"] = sampler
+
 
     if args.test_only:
         criterion = None  # faster evaluation

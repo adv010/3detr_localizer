@@ -234,6 +234,34 @@ def roty_batch(t):
     return output
 
 
+def rotz_batch_tensor(angles):
+    """
+    Create rotation matrices for Z-axis rotation (angle in radians)
+    Input: angles tensor of shape (...), e.g. (B, N), (B, N, 1), etc.
+    Output: rotation matrices of shape (..., 3, 3)
+    """
+    # Ensure shape is (...), not (..., 1)
+    if angles.shape[-1] == 1:
+        angles = angles.squeeze(-1)
+
+    # Compute cos and sin — will be shape (...)
+    c = torch.cos(angles)
+    s = torch.sin(angles)
+
+    # Get output shape: (..., 3, 3)
+    out_shape = angles.shape + (3, 3)
+    R = torch.zeros(out_shape, device=angles.device, dtype=angles.dtype)
+
+    # Fill in rotation matrix values
+    R[..., 0, 0] = c
+    R[..., 0, 1] = -s
+    R[..., 1, 0] = s
+    R[..., 1, 1] = c
+    R[..., 2, 2] = 1
+
+    return R
+
+
 def get_3d_box(box_size, heading_angle, center):
     """box_size is array(l,w,h), heading_angle is radius clockwise from pos x axis, center is xyz of box center
     output (8,3) array for 3D box cornders
@@ -309,11 +337,17 @@ def roty_batch_tensor(t):
     output[..., 2, 2] = c
     return output
 
-
 def get_3d_box_batch_tensor(box_size, angle, center):
     assert isinstance(box_size, torch.Tensor)
     assert isinstance(angle, torch.Tensor)
     assert isinstance(center, torch.Tensor)
+
+
+    # Preserve batch info
+    orig_shape = box_size.shape[:-1]  # [B,N]
+    box_size = box_size.reshape(-1, 3)  # [B*N,3]
+    angle = angle.reshape(-1)   # [B*N]
+    center = center.reshape(-1, 3)  # [B*N,3]
 
     reshape_final = False
     if angle.ndim == 2:
@@ -327,7 +361,7 @@ def get_3d_box_batch_tensor(box_size, angle, center):
         reshape_final = True
 
     input_shape = angle.shape
-    R = roty_batch_tensor(angle)
+    R = rotz_batch_tensor(angle) #R = rotz_batch_tensor(angle) 
     l = torch.unsqueeze(box_size[..., 0], -1)  # [x1,...,xn,1]
     w = torch.unsqueeze(box_size[..., 1], -1)
     h = torch.unsqueeze(box_size[..., 2], -1)
