@@ -7,9 +7,9 @@ from utils.box_util import (flip_axis_to_camera_np, flip_axis_to_camera_tensor,
                           get_3d_box_batch_np, get_3d_box_batch_tensor)
 from PIL import Image
 import random
+import pickle
+import open3d as o3d
 
-IGNORE_LABEL = -100
-MEAN_COLOR_RGB = np.array([109.8, 97.2, 83.8])
 
 class CustomDatasetConfig(object):
     def __init__(self):
@@ -64,10 +64,12 @@ class CustomDatasetConfig(object):
 
     def box_parametrization_to_corners(self, box_center_unnorm, box_size, box_angle):
         boxes = get_3d_box_batch_tensor(box_size, box_angle, box_center_unnorm)
+        # print("BPCshape", boxes.shape)
         return boxes
 
     def box_parametrization_to_corners_np(self, box_center_unnorm, box_size, box_angle):
         boxes = get_3d_box_batch_np(box_size, box_angle, box_center_unnorm)
+        # print("BPCNPshape", boxes.shape)
         return boxes
 
 
@@ -157,25 +159,88 @@ class CustomDetectionDataset(Dataset):
         """Constrain angle to [-π, π]"""
         return (angle + np.pi) % (2 * np.pi) - np.pi
     
+    def normalize_pc(self,points_flat, raw_boxes): 
+        centroid = np.mean(points_flat, axis=0)
+        centered_points = points_flat - centroid
+
+        scale = np.max(centered_points, axis=0) - np.min(centered_points, axis=0)
+        normalized_points = centered_points / scale[np.newaxis, :]
+
+        N = raw_boxes.shape[0]
+        centroids_expanded = np.tile(
+            np.repeat(centroid[np.newaxis, :], 8, axis=0)[np.newaxis, :, :],
+            (N, 1, 1)
+        )
+        boxes_centered = raw_boxes - centroids_expanded
+        scale_reshaped = scale.reshape(1, 1, 3)
+        normalized_boxes = boxes_centered / scale_reshaped
+        return normalized_points, normalized_boxes
+
+    def extract_center_size_yaw_from_segments(self, pc_segments):
+        results = []
+
+        for seg in pc_segments:
+            if seg.shape[0] < 4:
+                results.append(None)
+                continue
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(seg)
+            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
+            obb = pcd.get_oriented_bounding_box()
+            center = np.asarray(obb.center)
+            size = np.asarray(obb.extent)
+            R = np.asarray(obb.R)
+
+            x_axis = R[:, 0]
+            yaw = np.arctan2(-x_axis[1], x_axis[0])  # SUN RGB-D convention
+
+            results.append(np.concatenate([center, size, [yaw]]))
+
+        return np.array([r for r in results if r is not None])
 
     def __getitem__(self, idx):
         scene_path = self.scene_files[idx]
         subdir = os.path.dirname(scene_path)
         
         # Load data
-        pc = np.load(os.path.join(self.root_dir, subdir, "pc.npy")).reshape(-1, 3)
-        bboxes = np.load(os.path.join(self.root_dir, subdir, "bbox3d.npy"))  # (K,8,3)
+        raw_pc = np.load(os.path.join(self.root_dir, subdir, "pc.npy")) #3,H,W
+        pc = np.transpose(raw_pc, (1, 2, 0)).reshape(-1, 3) #H,W,3
+        pc_sun = flip_axis_to_camera_np(pc) # original coordinates of scene (X=right, Y=down/forward, Z=down to SUN RGB-D coordinates (X=right, Y=forward, Z=up)
 
-        # Convert boxes to center, size, yaw
-        gt_boxes = []
-        for box in bboxes:
-            center = box.mean(axis=0)
-            size = box.max(axis=0) - box.min(axis=0)
-            bottom_face = box[:4]
-            yaw = np.arctan2((bottom_face[1]-bottom_face[0])[1], 
-                            1e-6+(bottom_face[1]-bottom_face[0])[0])
-            gt_boxes.append(np.concatenate([center, size, [yaw]]))
-        gt_boxes = np.array(gt_boxes)
+        raw_boxes = np.load(os.path.join(self.root_dir, subdir, "bbox3d.npy"))  # (N,8,3)
+        rgb = np.array(Image.open(os.path.join(self.root_dir, subdir, "rgb.jpg"))) #(H, W, 3)
+        masks = np.load(os.path.join(self.root_dir, subdir,"mask.npy"))
+        rgb_pc = rgb.reshape(-1,3)/255.0
+        boxes_sun = flip_axis_to_camera_np(raw_boxes.reshape(-1, 3)).reshape(-1, 8, 3)
+        pc_sun_normalized, boxes_sun_normalized = self.normalize_pc(pc_sun,boxes_sun)
+        pc_segments = []
+        masks_flat = masks.reshape(masks.shape[0], -1)
+        for i in range(masks.shape[0]):
+          mask =masks_flat[i]
+          instance_points = pc_sun_normalized[mask > 0]  # (num_pts, 3)
+          pc_segments.append(instance_points)
+
+        gt_boxes = self.extract_center_size_yaw_from_segments(pc_segments)
+
+        # print("dumping pkl for vis.")
+        # debug_path = os.path.join(self.root_dir, f'debug_sample_{idx}.pkl')
+        # debug_data = {
+        # 'scene_path': subdir,
+        # 'pc': pc,
+        # 'boxes' : raw_boxes,
+        # 'pc_sun': pc_sun,
+        # 'boxes_sun': boxes_sun,
+        # 'rgb_pc' : rgb_pc,
+        # 'gt_boxes' : gt_boxes
+        # }
+
+        # with open(debug_path, 'wb') as f: # used for Debugging
+        #     pickle.dump(debug_data, f)
+
+        # # breakpoint()
+
 
         # Initialize targets
         MAX_NUM_OBJ = self.config.max_num_obj
@@ -189,7 +254,7 @@ class CustomDetectionDataset(Dataset):
         target_bboxes[:valid_boxes] = gt_boxes[:valid_boxes, :6]
         target_mask[:valid_boxes] = 1
 
-        # Convert angles using dataset config
+        # AT Train/Test time, do angle conversion with binning
         for i in range(valid_boxes):
             angle = gt_boxes[i, 6]
             angle_classes[i], angle_residuals[i] = self.config.angle2class(angle)
@@ -199,13 +264,13 @@ class CustomDetectionDataset(Dataset):
         if self.augment:
             # Flipping
             if np.random.rand() > 0.5:
-                pc[:, 0] = -pc[:, 0]
+                pc_sun_normalized[:, 0] = -pc_sun_normalized[:, 0]
                 target_bboxes[:, 0] = -target_bboxes[:, 0]
                 target_angles = np.array([self.config.class2angle(*self.config.angle2class(np.pi - a)) 
                                         for a in target_angles])
 
             if np.random.rand() > 0.5:
-                pc[:, 1] = -pc[:, 1]
+                pc_sun_normalized[:, 1] = -pc_sun_normalized[:, 1]
                 target_bboxes[:, 1] = -target_bboxes[:, 1]
                 target_angles = np.array([self.config.class2angle(*self.config.angle2class(-a)) 
                                         for a in target_angles])
@@ -217,7 +282,7 @@ class CustomDetectionDataset(Dataset):
                 [np.sin(rot_angle), np.cos(rot_angle), 0],
                 [0, 0, 1]
             ])
-            pc[:, :3] = pc[:, :3] @ rot_mat.T
+            pc_sun_normalized[:, :3] = pc_sun_normalized[:, :3] @ rot_mat.T
             target_bboxes[:, :3] = target_bboxes[:, :3] @ rot_mat.T
             
             # Update angles using config's rotation handling
@@ -226,9 +291,13 @@ class CustomDetectionDataset(Dataset):
             angle_classes, angle_residuals = zip(*[self.config.angle2class(a) for a in target_angles])
             angle_classes, angle_residuals = np.array(angle_classes), np.array(angle_residuals)
 
+        point_cloud, choices = pc_util.random_sampling(
+            pc_sun_normalized, self.num_points, return_choices=True
+        )
+
         # Normalization
-        pc_min = pc.min(axis=0)
-        pc_max = pc.max(axis=0)
+        pc_min = point_cloud.min(axis=0)
+        pc_max = point_cloud.max(axis=0)
         
         box_centers = target_bboxes[:, :3]
         box_centers_normalized = (box_centers - pc_min) / (pc_max - pc_min + 1e-6)
@@ -242,7 +311,7 @@ class CustomDetectionDataset(Dataset):
         ).squeeze(0)
 
         return {
-            "point_clouds": pc.astype(np.float32),
+            "point_clouds": point_cloud.astype(np.float32),
             "gt_box_corners": box_corners.astype(np.float32),
             "gt_box_centers": box_centers.astype(np.float32),
             "gt_box_centers_normalized": box_centers_normalized.astype(np.float32),

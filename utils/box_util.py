@@ -345,11 +345,12 @@ def get_3d_box_batch_tensor(box_size, angle, center):
 
     # Preserve batch info
     orig_shape = box_size.shape[:-1]  # [B,N]
+    bsize = orig_shape[0]
     box_size = box_size.reshape(-1, 3)  # [B*N,3]
     angle = angle.reshape(-1)   # [B*N]
     center = center.reshape(-1, 3)  # [B*N,3]
 
-    reshape_final = False
+    reshape_final = True
     if angle.ndim == 2:
         assert box_size.ndim == 3
         assert center.ndim == 3
@@ -382,7 +383,7 @@ def get_3d_box_batch_tensor(box_size, angle, center):
     corners_3d = torch.matmul(corners_3d, R.permute(tlist))
     corners_3d += torch.unsqueeze(center, -2)
     if reshape_final:
-        corners_3d = corners_3d.reshape(bsize, nprop, 8, 3)
+        corners_3d = corners_3d.reshape(bsize, -1, 8, 3)
     return corners_3d
 
 
@@ -563,6 +564,8 @@ def generalized_box3d_iou_tensor(
     Returns:
         B x K1 x K2 matrix of generalized IOU by approximating the boxes to be axis aligned
     """
+    corners1 = corners1.reshape(-1,64,8,3)
+    corners2 = corners2.reshape(-1,64,8,3)
     assert len(corners1.shape) == 4
     assert len(corners2.shape) == 4
     assert corners1.shape[2] == 8

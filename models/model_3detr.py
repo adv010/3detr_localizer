@@ -256,7 +256,7 @@ class Model3DETR(nn.Module):
             box_corners = self.box_processor.box_parametrization_to_corners(
                 center_unnormalized, size_unnormalized, angle_continuous
             )
-            box_corners = box_corners.unsqueeze(0)
+            # box_corners = box_corners.unsqueeze(0)
 
             box_prediction = {
                 "center_normalized": center_normalized.contiguous(),
@@ -269,7 +269,6 @@ class Model3DETR(nn.Module):
                 "box_corners": box_corners,
             }
             outputs.append(box_prediction)
-
         return {
             "outputs": outputs[-1],  # Last layer
             "aux_outputs": outputs[:-1]  # Intermediate layers
@@ -308,7 +307,8 @@ class Model3DETR(nn.Module):
         box_predictions = self.get_box_predictions(
             query_xyz, point_cloud_dims, box_features
         )
-        return box_predictions
+        #print("after self.get_box_predictions", box_predictions.keys())
+        return box_predictions 
 
 
 def build_preencoder(args):

@@ -117,9 +117,9 @@ class APCalculator(object):
         self.ap_config_dict = ap_config_dict
         self.class2type_map = class2type_map
         self.reset()
-
     def make_gt_list(self, gt_box_corners, gt_box_present):
         batch_gt_map_cls = []
+        gt_box_corners = gt_box_corners.reshape(-1,64,8,3)
         bsize = gt_box_corners.shape[0]
         for i in range(bsize):
             batch_gt_map_cls.append(

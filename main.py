@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 import pickle
+from torch.utils.data._utils.collate import default_collate
 
 import numpy as np
 import torch
@@ -121,11 +122,11 @@ def make_args_parser():
               If None, default values from scannet.py/sunrgbd.py are used",
     )
     parser.add_argument("--dataset_num_workers", default=2, type=int)
-    parser.add_argument("--batchsize_per_gpu", default=1, type=int)
+    parser.add_argument("--batchsize_per_gpu", default=8, type=int)
 
     ##### Training #####
     parser.add_argument("--start_epoch", default=-1, type=int)
-    parser.add_argument("--max_epoch", default=720, type=int)
+    parser.add_argument("--max_epoch", default=50, type=int)
     parser.add_argument("--eval_every_epoch", default=10, type=int)
     parser.add_argument("--seed", default=0, type=int)
 
@@ -191,15 +192,6 @@ def do_train(
       model_dict.update(compatible)
       model_no_ddp.load_state_dict(model_dict)
       print(f" Loaded {len(compatible)} pretrained layers.")
-
-
-      print("Freezing pre_encoder and encoder layers...")
-      for name, param in model_no_ddp.named_parameters():
-          if name.startswith("pre_encoder") or name.startswith("encoder"):
-              param.requires_grad = False
-              print(f" - Frozen: {name}")
-      num_frozen = sum(not p.requires_grad for p in model_no_ddp.parameters())
-      num_total = sum(1 for p in model_no_ddp.parameters())
 
     final_eval = os.path.join(args.checkpoint_dir, "final_eval.txt")
     final_eval_pkl = os.path.join(args.checkpoint_dir, "final_eval.pkl")
@@ -364,6 +356,64 @@ def test_model(args, model, model_no_ddp, criterion, dataset_config, dataloaders
         print("==" * 10)
 
 
+
+def custom_collate_fn(batch):
+    """
+    Complete collate function for 3DETR that handles:
+    - Point clouds with variable points
+    - Variable number of boxes
+    - All required fields from the dataset
+    """
+    elem = batch[0]
+    batch_dict = {}
+    
+    # Point cloud fields (pad to max points)
+    pc_fields = ['point_clouds']
+    for field in pc_fields:
+        if field in elem:
+            max_points = max([item[field].shape[0] for item in batch])
+            padded = []
+            for item in batch:
+                data = item[field]
+                if data.shape[0] < max_points:
+                    padding = np.zeros((max_points - data.shape[0], data.shape[1]), dtype=data.dtype)
+                    padded_data = np.concatenate([data, padding], axis=0)
+                else:
+                    padded_data = data[:max_points]
+                padded.append(torch.from_numpy(padded_data))
+            batch_dict[field] = torch.stack(padded)
+
+    # Box fields (pad to max boxes)
+    box_fields = [
+        'gt_box_corners', 'gt_box_centers', 'gt_box_centers_normalized',
+        'gt_box_sizes', 'gt_box_sizes_normalized', 'gt_box_angles',
+        'gt_box_present', 'gt_angle_class_label', 'gt_angle_residual_label'
+    ]
+    for field in box_fields:
+        if field in elem:
+            max_boxes = max([item[field].shape[0] for item in batch])
+            padded = []
+            for item in batch:
+                data = item[field]
+                if data.shape[0] < max_boxes:
+                    padding_shape = (max_boxes - data.shape[0], *data.shape[1:])
+                    padding = np.zeros(padding_shape, dtype=data.dtype)
+                    padded_data = np.concatenate([data, padding], axis=0)
+                else:
+                    padded_data = data[:max_boxes]
+                padded.append(torch.from_numpy(padded_data))
+            batch_dict[field] = torch.stack(padded)
+
+    # Scalar fields (direct stacking)
+    scalar_fields = [
+        'point_cloud_dims_min', 'point_cloud_dims_max'
+    ]
+    for field in scalar_fields:
+        if field in elem:
+            batch_dict[field] = torch.stack([torch.from_numpy(item[field]) for item in batch])
+
+    return batch_dict
+
 def main(local_rank, args):
     if args.ngpus > 1:
         print(
@@ -398,8 +448,6 @@ def main(local_rank, args):
     criterion = build_criterion(args, dataset_config)
     criterion = criterion.cuda(local_rank)
 
-
-
     dataloaders = {}
     if args.test_only:
         dataset_splits = ["test"]
@@ -432,6 +480,7 @@ def main(local_rank, args):
             batch_size=args.batchsize_per_gpu,
             num_workers=args.dataset_num_workers,
             worker_init_fn=my_worker_init_fn,
+            collate_fn = custom_collate_fn
         )
         dataloaders[f"{split}_sampler"] = sampler
 

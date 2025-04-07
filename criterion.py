@@ -165,6 +165,10 @@ class SetCriterion(nn.Module):
         return {"loss_giou": giou_loss}
 
     def single_output_forward(self, outputs, targets):
+        # print("Output box corners shape:", outputs["box_corners"].shape)
+        # print("Target box corners shape:", targets["gt_box_corners"].shape)
+        # print("Number of actual GT:", targets["nactual_gt"])
+        targets["gt_box_corners"] = targets["gt_box_corners"].reshape(-1,8,3)
         gious = generalized_box3d_iou(
             outputs["box_corners"],
             targets["gt_box_corners"],
